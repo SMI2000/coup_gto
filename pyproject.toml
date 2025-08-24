@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coup-gto"
+version = "0.0.1"
+description = "GTO analysis for Coup (base game, 2-player first)"
+authors = [{ name = "Coup GTO" }]
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://example.com"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coup_gto*"]
