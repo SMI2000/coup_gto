@@ -73,6 +73,37 @@ class GameState:
             return alive[0]
         return None
 
+    # --- Cloning ---
+    def clone(self) -> "GameState":
+        # Create a deep copy without invoking __init__ to preserve state
+        gs = GameState.__new__(GameState)
+        gs.num_players = self.num_players
+        gs.rules = self.rules
+        # Deep copy players
+        gs.players = [
+            PlayerState(coins=p.coins, hand=list(p.hand), revealed=list(p.revealed))
+            for p in self.players
+        ]
+        gs.deck = list(self.deck)
+        gs.current_player = self.current_player
+        # Initialize with a fixed seed to avoid OS entropy calls during frequent clones,
+        # then restore the exact RNG state from the source GameState.
+        saved_state = self.rng.getstate()
+        gs.rng = random.Random(0)
+        gs.rng.setstate(saved_state)
+
+        # Pending interaction fields
+        gs.pending_action = (
+            None
+            if self.pending_action is None
+            else Action(actor=self.pending_action.actor, type=self.pending_action.type, target=self.pending_action.target)
+        )
+        gs.pending_blocker = self.pending_blocker
+        gs.pending_block_role = self.pending_block_role
+        gs.awaiting_response_from = self.awaiting_response_from
+        gs.pending_claim_role = self.pending_claim_role
+        return gs
+
     # --- Actions ---
     def legal_actions(self) -> List[Action]:
         if self.winner() is not None:
