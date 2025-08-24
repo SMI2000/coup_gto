@@ -22,6 +22,10 @@ class ActionType(Enum):
     ASSASSINATE = auto()  # Assassin: pay 3, target loses 1 influence
     STEAL = auto()  # Captain: steal 2
     EXCHANGE = auto()  # Ambassador: draw 2, choose 2 to keep
+    # Interaction/response actions
+    PASS = auto()
+    BLOCK_FOREIGN_AID = auto()
+    CHALLENGE = auto()
 
 
 @dataclass(frozen=True)

@@ -27,6 +27,15 @@ class GameState:
     current_player: int = field(init=False, default=0)
     rng: random.Random = field(init=False)
 
+    # Interaction state
+    # If not None, an action is awaiting responses (e.g., Foreign Aid block window)
+    pending_action: Optional[Action] = field(init=False, default=None)
+    # If a block has been declared, track who blocked and the claimed role
+    pending_blocker: Optional[int] = field(init=False, default=None)
+    pending_block_role: Optional[Role] = field(init=False, default=None)
+    # Whose response is awaited (e.g., the original actor deciding to challenge or pass)
+    awaiting_response_from: Optional[int] = field(init=False, default=None)
+
     def __init__(self, num_players: int, seed: Optional[int] = 0, rules: Optional[BaseRules] = None):
         assert 2 <= num_players <= 6, "Coup supports 2-6 players"
         self.num_players = num_players
@@ -66,6 +75,10 @@ class GameState:
     def legal_actions(self) -> List[Action]:
         if self.winner() is not None:
             return []
+        # If an interaction is pending, return response options
+        if self.pending_action is not None:
+            return self._legal_responses()
+
         actor = self.current_player
         ps = self.players[actor]
 
@@ -76,7 +89,7 @@ class GameState:
         actions: List[Action] = []
         # Income
         actions.append(Action(actor=actor, type=ActionType.INCOME))
-        # Foreign Aid (block handling not implemented yet)
+        # Foreign Aid (block/challenge handled via pending interaction)
         actions.append(Action(actor=actor, type=ActionType.FOREIGN_AID))
         # Coup if enough coins
         if ps.coins >= self.rules.coup_cost:
@@ -93,28 +106,99 @@ class GameState:
         return None
 
     def apply(self, action: Action) -> None:
-        assert action.actor == self.current_player, "Not this player's turn"
-        assert action in self._as_set(self.legal_actions()), f"Illegal action: {action}"
+        # If in a response window, the responder may not be the current_player
+        legal = self.legal_actions()
+        assert action in self._as_set(legal), f"Illegal action: {action}"
+        if self.pending_action is None:
+            assert action.actor == self.current_player, "Not this player's turn"
 
         if action.type == ActionType.INCOME:
             self._apply_income(action)
         elif action.type == ActionType.FOREIGN_AID:
-            self._apply_foreign_aid(action)
+            self._start_foreign_aid_interaction(action)
         elif action.type == ActionType.COUP:
             self._apply_coup(action)
+        elif action.type == ActionType.PASS:
+            self._apply_pass(action)
+        elif action.type == ActionType.BLOCK_FOREIGN_AID:
+            self._apply_block_foreign_aid(action)
+        elif action.type == ActionType.CHALLENGE:
+            self._apply_challenge(action)
         else:
             raise NotImplementedError(f"Action not yet implemented: {action.type}")
 
         # advance turn if game not over
-        if self.winner() is None:
+        if self.winner() is None and self.pending_action is None and self.awaiting_response_from is None:
             self.next_player()
 
     def _apply_income(self, action: Action) -> None:
         self.players[action.actor].coins += 1
 
-    def _apply_foreign_aid(self, action: Action) -> None:
-        # Block and challenge not implemented yet
-        self.players[action.actor].coins += 2
+    # --- Interaction: Foreign Aid ---
+    def _start_foreign_aid_interaction(self, action: Action) -> None:
+        # Start a response window: opponents may block with Duke.
+        self.pending_action = action
+        # In 2-player, the only potential blocker is the opponent
+        self.awaiting_response_from = self._default_target()
+
+    def _legal_responses(self) -> List[Action]:
+        assert self.pending_action is not None
+        acts: List[Action] = []
+        # Foreign Aid response window
+        if self.pending_action.type == ActionType.FOREIGN_AID:
+            if self.pending_blocker is None:
+                # The opponent can pass or declare a block with Duke
+                responder = self.awaiting_response_from
+                assert responder is not None
+                acts.append(Action(actor=responder, type=ActionType.PASS))
+                acts.append(Action(actor=responder, type=ActionType.BLOCK_FOREIGN_AID))
+            else:
+                # A block was declared; the original actor may challenge or pass (accept block)
+                actor = self.pending_action.actor
+                acts.append(Action(actor=actor, type=ActionType.CHALLENGE))
+                acts.append(Action(actor=actor, type=ActionType.PASS))
+        return acts
+
+    def _apply_pass(self, action: Action) -> None:
+        # Handle passes depending on the interaction stage
+        assert self.pending_action is not None
+        if self.pending_action.type == ActionType.FOREIGN_AID:
+            if self.pending_blocker is None:
+                # No block declared -> FA succeeds
+                self.players[self.pending_action.actor].coins += 2
+                self._clear_pending()
+            else:
+                # Actor accepts the block -> FA fails
+                self._clear_pending()
+
+    def _apply_block_foreign_aid(self, action: Action) -> None:
+        # Opponent claims Duke to block FA
+        assert self.pending_action is not None and self.pending_action.type == ActionType.FOREIGN_AID
+        assert action.actor != self.pending_action.actor, "Actor cannot block own action"
+        self.pending_blocker = action.actor
+        self.pending_block_role = Role.DUKE
+        # Now the original actor may challenge or pass
+        self.awaiting_response_from = self.pending_action.actor
+
+    def _apply_challenge(self, action: Action) -> None:
+        assert self.pending_action is not None
+        # Only case implemented: challenge a Duke block on Foreign Aid
+        assert self.pending_action.type == ActionType.FOREIGN_AID
+        assert self.pending_blocker is not None and self.pending_block_role == Role.DUKE
+        challenger = action.actor
+        blocker = self.pending_blocker
+        # Resolve challenge
+        if self._player_has_role(blocker, Role.DUKE):
+            # Blocker truthfully reveals Duke; challenger loses influence; FA remains blocked
+            self._truthful_reveal(blocker, Role.DUKE)
+            self._lose_influence(challenger)
+            # FA blocked; finish interaction
+            self._clear_pending()
+        else:
+            # Blocker fails; blocker loses influence; FA succeeds
+            self._lose_influence(blocker)
+            self.players[self.pending_action.actor].coins += 2
+            self._clear_pending()
 
     def _apply_coup(self, action: Action) -> None:
         assert action.target is not None, "Coup requires a target"
@@ -126,6 +210,33 @@ class GameState:
         if target_ps.hand:
             lost = target_ps.hand.pop(0)
             target_ps.revealed.append(lost)
+
+    # --- Common helpers ---
+    def _player_has_role(self, pid: int, role: Role) -> bool:
+        return role in self.players[pid].hand
+
+    def _truthful_reveal(self, pid: int, role: Role) -> None:
+        # Reveal role from hand, then shuffle it back into deck and draw a replacement.
+        ps = self.players[pid]
+        assert role in ps.hand, "Cannot truthfully reveal a role not in hand"
+        ps.hand.remove(role)
+        # Show and return to deck, shuffle, draw
+        self.deck.append(role)
+        self.rng.shuffle(self.deck)
+        if self.deck:
+            ps.hand.append(self.deck.pop())
+
+    def _lose_influence(self, pid: int) -> None:
+        ps = self.players[pid]
+        if ps.hand:
+            lost = ps.hand.pop(0)
+            ps.revealed.append(lost)
+        
+    def _clear_pending(self) -> None:
+        self.pending_action = None
+        self.pending_blocker = None
+        self.pending_block_role = None
+        self.awaiting_response_from = None
 
     @staticmethod
     def _as_set(actions: List[Action]) -> List[Action]:
