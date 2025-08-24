@@ -59,43 +59,50 @@ def infoset_key(gs: GameState, player: int) -> str:
 
 @dataclass
 class NodeStats:
-    # Per-action accumulators keyed by action_key
-    regret_sum: Dict[str, float] = field(default_factory=dict)
-    strategy_sum: Dict[str, float] = field(default_factory=dict)
+    def __init__(self):
+        self.regret_sum: Dict[str, float] = {}
+        self.strategy_sum: Dict[str, float] = {}
 
-    def get_strategy(self, legal: List[Action], realization_weight: float) -> List[float]:
-        # Regret-matching over current legal actions
-        keys = [action_key(a) for a in legal]
-        regrets = [max(0.0, self.regret_sum.get(k, 0.0)) for k in keys]
+    def get_strategy(self, legal: List[Action], realization_weight: float = 0.0) -> List[float]:
+        # Build current strategy from positive regrets (regret-matching)
+        regrets = [max(0.0, self.regret_sum.get(action_key(a), 0.0)) for a in legal]
         normalizer = sum(regrets)
-        if normalizer > 1e-12:
-            strat = [r / normalizer for r in regrets]
+        if normalizer <= 0.0:
+            strategy = [1.0 / len(legal)] * len(legal) if legal else []
         else:
-            # Uniform if no positive regret
-            n = len(legal)
-            strat = [1.0 / n for _ in range(n)] if n > 0 else []
-        # Accumulate average strategy with current reach weight
-        for k, p in zip(keys, strat):
-            self.strategy_sum[k] = self.strategy_sum.get(k, 0.0) + realization_weight * p
-        return strat
+            strategy = [r / normalizer for r in regrets]
+        # Accumulate average strategy using player's reach weight
+        if realization_weight > 0.0 and legal:
+            for p, a in zip(strategy, legal):
+                k = action_key(a)
+                self.strategy_sum[k] = self.strategy_sum.get(k, 0.0) + realization_weight * p
+        return strategy
 
     def get_average_strategy(self, legal: List[Action]) -> List[float]:
-        keys = [action_key(a) for a in legal]
-        vals = [self.strategy_sum.get(k, 0.0) for k in keys]
+        if not legal:
+            return []
+        vals = [self.strategy_sum.get(action_key(a), 0.0) for a in legal]
         s = sum(vals)
-        if s > 1e-12:
-            return [v / s for v in vals]
-        # Default to uniform
-        n = len(legal)
-        return [1.0 / n for _ in range(n)] if n > 0 else []
+        if s <= 1e-12:
+            return [1.0 / len(legal)] * len(legal)
+        return [v / s for v in vals]
 
 
 class MCCFRSolver:
-    def __init__(self, seed: int = 0, max_depth: int = 300, debug: bool = False):
+    def __init__(
+        self,
+        seed: int = 0,
+        max_depth: int = 300,
+        debug: bool = False,
+        traversal_mode: str = "sampled",  # 'sampled' (default) or 'full'
+        log_infoset_hash: bool = False,
+    ):
         self.nodes: Dict[str, NodeStats] = {}
         self.rng = random.Random(seed)
         self.max_depth = max_depth
         self.debug = debug
+        self.traversal_mode = traversal_mode
+        self.log_infoset_hash = log_infoset_hash
 
     def iterate(self, iterations: int = 1, game_seed: Optional[int] = None):
         for _ in range(iterations):
@@ -126,39 +133,71 @@ class MCCFRSolver:
         # Chance events are embedded in apply() via RNG when drawing/shuffling.
         # This scaffolding treats all non-player-stochasticity as part of environment.
 
-        key = infoset_key(gs, current if current == updating_player else updating_player)
+        # Always index by the decision-maker's infoset (current player)
+        key = infoset_key(gs, current)
         node = self.nodes.setdefault(key, NodeStats())
 
-        # If it's the updating player's decision, sample a single action to avoid exponential branching
+        # If it's the updating player's decision
         if current == updating_player:
+            # For averaging, weight by the updating player's reach probability at this infoset
+            strategy = node.get_strategy(legal, realization_weight=reach_prob_updating)
+            if self.traversal_mode == "full":
+                # Full-branch traversal: evaluate all legal actions for proper regret updates
+                action_utils: List[float] = []
+                for i, a in enumerate(legal):
+                    gs_next = self._clone_and_apply(gs, a)
+                    u = self._mccfr_traverse(
+                        gs_next,
+                        updating_player,
+                        reach_prob_other=reach_prob_other,
+                        reach_prob_updating=reach_prob_updating * strategy[i],
+                        depth=depth + 1,
+                    )
+                    action_utils.append(u)
+                node_utility = sum(p * u for p, u in zip(strategy, action_utils))
+                # Update regrets for all actions
+                keys = [action_key(a) for a in legal]
+                for k, u in zip(keys, action_utils):
+                    regret = u - node_utility
+                    node.regret_sum[k] = node.regret_sum.get(k, 0.0) + reach_prob_other * regret
+                return node_utility
+            else:
+                # Sampled traversal: pick one action to avoid exponential branching (fast path)
+                idx = self._sample_from_dist(strategy) if legal else 0
+                a = legal[idx]
+                gs_next = self._clone_and_apply(gs, a)
+                # Optional debug
+                if self.debug:
+                    if self.log_infoset_hash:
+                        key_dbg = hex(hash(key) & 0xFFFFFFFF)
+                    else:
+                        key_dbg = key
+                    print(f"[MCCFR] sampled mode depth={depth} cur={current} act={a.type.name} idx={idx} infoset={key_dbg}")
+                u = self._mccfr_traverse(
+                    gs_next,
+                    updating_player,
+                    reach_prob_other=reach_prob_other,
+                    reach_prob_updating=reach_prob_updating * strategy[idx],
+                    depth=depth + 1,
+                )
+                # Outcome-sampling regret update (importance-weighted) for the sampled action only
+                # Estimate node utility with the sampled outcome as a plug-in estimator
+                node_utility = u
+                p_s = max(1e-12, strategy[idx])
+                k = action_key(a)
+                node.regret_sum[k] = node.regret_sum.get(k, 0.0) + (reach_prob_other / p_s) * (u - node_utility)
+                return node_utility
+        else:
+            # Opponent node: compute their current strategy and update their average with their reach
             strategy = node.get_strategy(legal, realization_weight=reach_prob_other)
             idx = self._sample_from_dist(strategy) if legal else 0
             a = legal[idx]
             gs_next = self._clone_and_apply(gs, a)
-            u = self._mccfr_traverse(
-                gs_next,
-                updating_player,
-                reach_prob_other=reach_prob_other,
-                reach_prob_updating=reach_prob_updating * strategy[idx],
-                depth=depth + 1,
-            )
-            # Use the sampled utility as node utility for this visit
-            node_utility = u
-            # Minimal regret update: only touch the sampled action (keeps storage bounded, OK for smoke tests)
-            k = action_key(a)
-            node.regret_sum[k] = node.regret_sum.get(k, 0.0) + reach_prob_other * (u - node_utility)
-            return node_utility
-        else:
-            # Sample opponent action according to their current average strategy (or current strategy)
-            # Use current-strategy for traversal
-            opp_strategy = node.get_strategy(legal, realization_weight=0.0)
-            idx = self._sample_from_dist(opp_strategy)
-            a = legal[idx]
-            gs_next = self._clone_and_apply(gs, a)
+            # Recurse, updating opponent reach prob and keeping updating player's reach
             return self._mccfr_traverse(
                 gs_next,
                 updating_player,
-                reach_prob_other=reach_prob_other * opp_strategy[idx],
+                reach_prob_other=reach_prob_other * strategy[idx],
                 reach_prob_updating=reach_prob_updating,
                 depth=depth + 1,
             )
@@ -180,15 +219,43 @@ class MCCFRSolver:
 
     def action_probabilities(self, gs: GameState) -> List[Tuple[Action, float]]:
         legal = gs.legal_actions()
-        key = infoset_key(gs, gs.current_player)
-        node = self.nodes.get(key)
-        if node is None:
-            # uniform
-            n = len(legal)
-            probs = [1.0 / n for _ in range(n)] if n else []
-        else:
-            probs = node.get_average_strategy(legal)
-        return list(zip(legal, probs))
+        current = gs.current_player
+        key = infoset_key(gs, current)
+        node = self.nodes.setdefault(key, NodeStats())
+        # Prefer average strategy if available; fall back to current strategy
+        avg = node.get_average_strategy(legal)
+        strategy = avg if avg and sum(avg) > 0 else node.get_strategy(legal, realization_weight=0.0)
+        return list(zip(legal, strategy))
+
+    def save_checkpoint(self, path: str) -> None:
+        data = {
+            "nodes": {
+                k: {
+                    "regret_sum": v.regret_sum,
+                    "strategy_sum": v.strategy_sum,
+                }
+                for k, v in self.nodes.items()
+            },
+            "config": {
+                "max_depth": self.max_depth,
+                "traversal_mode": self.traversal_mode,
+            },
+        }
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def load_checkpoint(self, path: str) -> None:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        nodes = data.get("nodes", {})
+        self.nodes = {}
+        for k, v in nodes.items():
+            ns = NodeStats()
+            ns.regret_sum = {kk: float(vv) for kk, vv in v.get("regret_sum", {}).items()}
+            ns.strategy_sum = {kk: float(vv) for kk, vv in v.get("strategy_sum", {}).items()}
+            self.nodes[k] = ns
 
     def evaluate(self, episodes: int = 100, seed: Optional[int] = None) -> float:
         # Self-play using average strategies; return avg utility for player 0
