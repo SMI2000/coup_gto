@@ -17,14 +17,16 @@ class ActionType(Enum):
     INCOME = auto()
     FOREIGN_AID = auto()
     COUP = auto()
-    # Claimed actions (not yet implemented in engine resolution)
-    TAX = auto()  # Duke: take 3
-    ASSASSINATE = auto()  # Assassin: pay 3, target loses 1 influence
-    STEAL = auto()  # Captain: steal 2
-    EXCHANGE = auto()  # Ambassador: draw 2, choose 2 to keep
+    TAX = auto()
+    STEAL = auto()
+    ASSASSINATE = auto()
+    EXCHANGE = auto()
     # Interaction/response actions
     PASS = auto()
     BLOCK_FOREIGN_AID = auto()
+    BLOCK_ASSASSINATE = auto()
+    BLOCK_STEAL_CAPTAIN = auto()
+    BLOCK_STEAL_AMBASSADOR = auto()
     CHALLENGE = auto()
 
 
