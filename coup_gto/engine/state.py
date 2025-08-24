@@ -95,6 +95,8 @@ class GameState:
         actions.append(Action(actor=actor, type=ActionType.FOREIGN_AID))
         # Duke Tax (challengeable claim)
         actions.append(Action(actor=actor, type=ActionType.TAX))
+        # Ambassador Exchange (challengeable claim)
+        actions.append(Action(actor=actor, type=ActionType.EXCHANGE))
         # Captain Steal (challengeable, blockable by Captain or Ambassador)
         if actor != self._default_target():
             actions.append(Action(actor=actor, type=ActionType.STEAL, target=self._default_target()))
@@ -142,6 +144,8 @@ class GameState:
             self._apply_challenge(action)
         elif action.type == ActionType.TAX:
             self._start_tax_interaction(action)
+        elif action.type == ActionType.EXCHANGE:
+            self._start_exchange_interaction(action)
         elif action.type == ActionType.STEAL:
             self._start_steal_interaction(action)
         elif action.type == ActionType.ASSASSINATE:
@@ -181,6 +185,12 @@ class GameState:
                 acts.append(Action(actor=actor, type=ActionType.PASS))
         # Tax response window (opponent can challenge or pass)
         elif self.pending_action.type == ActionType.TAX:
+            responder = self.awaiting_response_from
+            assert responder is not None
+            acts.append(Action(actor=responder, type=ActionType.CHALLENGE))
+            acts.append(Action(actor=responder, type=ActionType.PASS))
+        # Exchange response window
+        elif self.pending_action.type == ActionType.EXCHANGE:
             responder = self.awaiting_response_from
             assert responder is not None
             acts.append(Action(actor=responder, type=ActionType.CHALLENGE))
@@ -228,6 +238,10 @@ class GameState:
         elif self.pending_action.type == ActionType.TAX:
             # Opponent passed -> TAX succeeds
             self.players[self.pending_action.actor].coins += 3
+            self._clear_pending()
+        elif self.pending_action.type == ActionType.EXCHANGE:
+            # Opponent passed -> perform exchange
+            self._perform_exchange(self.pending_action.actor)
             self._clear_pending()
         elif self.pending_action.type == ActionType.STEAL:
             if self.pending_blocker is None:
@@ -309,6 +323,18 @@ class GameState:
                 self._clear_pending()
             else:
                 # Actor bluffed: loses 1, Tax fails
+                self._lose_influence(actor)
+                self._clear_pending()
+        elif self.pending_action.type == ActionType.EXCHANGE:
+            # Challenge to Ambassador claim
+            challenger = action.actor
+            actor = self.pending_action.actor
+            if self._player_has_role(actor, Role.AMBASSADOR):
+                self._truthful_reveal(actor, Role.AMBASSADOR)
+                self._lose_influence(challenger)
+                self._perform_exchange(actor)
+                self._clear_pending()
+            else:
                 self._lose_influence(actor)
                 self._clear_pending()
         elif self.pending_action.type == ActionType.STEAL:
@@ -452,6 +478,27 @@ class GameState:
         amt = min(2, self.players[target].coins)
         self.players[target].coins -= amt
         self.players[actor].coins += amt
+
+    def _start_exchange_interaction(self, action: Action) -> None:
+        self.pending_action = action
+        self.pending_claim_role = Role.AMBASSADOR
+        self.awaiting_response_from = self._default_target()
+
+    def _perform_exchange(self, actor: int) -> None:
+        # Deterministic: draw top 2 from deck, choose 2 to keep among 4 by sorted name, return others to bottom
+        drawn: List[Role] = []
+        for _ in range(2):
+            if self.deck:
+                drawn.append(self.deck.pop(0))
+        combined = self.players[actor].hand + drawn
+        # keep exactly cards_per_player
+        keep_n = self.rules.cards_per_player
+        kept = sorted(combined, key=lambda r: r.value)[:keep_n]
+        returned = [r for r in combined if r not in kept or kept.count(r) < combined.count(r)]
+        # Update hand
+        self.players[actor].hand = kept
+        # Return others to bottom of deck, preserve current order of 'returned'
+        self.deck.extend(returned)
 
     @staticmethod
     def _as_set(actions: List[Action]) -> List[Action]:
